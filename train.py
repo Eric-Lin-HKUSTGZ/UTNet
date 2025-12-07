@@ -3,6 +3,33 @@ Training Script for UTNet
 单阶段端到端训练
 支持多GPU分布式训练
 """
+# ========== COMPATIBILITY PATCHES ==========
+# Must be applied BEFORE any other imports to fix NumPy/chumpy compatibility
+import numpy as np
+import inspect
+
+# Patch NumPy for old pickle files and chumpy compatibility (NumPy 1.20+, 2.0+)
+if not hasattr(np, 'bool'):
+    np.bool = np.bool_
+if not hasattr(np, 'int'):
+    np.int = np.int_
+if not hasattr(np, 'float'):
+    np.float = np.float64
+if not hasattr(np, 'complex'):
+    np.complex = np.complex128
+if not hasattr(np, 'object'):
+    np.object = np.object_
+if not hasattr(np, 'unicode'):
+    np.unicode = np.str_
+if not hasattr(np, 'str'):
+    np.str = np.str_
+
+# Patch inspect for Python 3.8+ compatibility with old chumpy
+if not hasattr(inspect, 'getargspec'):
+    inspect.getargspec = inspect.getfullargspec
+
+# ========== END PATCHES ==========
+
 import os
 import yaml
 import argparse
@@ -21,6 +48,7 @@ from pathlib import Path
 
 import sys
 from pathlib import Path
+from typing import Optional
 
 # Add project root to path
 project_root = Path(__file__).parent
@@ -28,6 +56,7 @@ sys.path.insert(0, str(project_root))
 
 from dataloader.dex_ycb_dataset import DexYCBDataset
 from dataloader.ho3d_dataset import HO3DDataset
+from metrics.evaluator import Evaluator
 from src.models.utnet import UTNet
 from src.losses.loss import UTNetLoss
 from src.utils.detection import HandDetector
@@ -42,8 +71,23 @@ def load_config(config_path: str) -> dict:
 
 def create_dataloader(config: dict, split: str = 'train', 
                      distributed: bool = False, rank: int = 0, world_size: int = 1):
-    """Create data loader with optional distributed sampling"""
+    """
+    Create data loader with optional distributed sampling and train/val split
+    
+    Args:
+        config: Configuration dictionary
+        split: 'train', 'val', or 'test'
+        distributed: Whether to use distributed training
+        rank: Process rank for distributed training
+        world_size: Number of processes for distributed training
+    
+    Note:
+        For HO3D, 'val' split uses a subset of 'train' split since evaluation split
+        has no complete GT annotations. The split ratio is controlled by 
+        config['training']['val_split_ratio'].
+    """
     dataset_name = config['dataset'].get('name', 'DexYCB').lower()
+    val_split_ratio = config.get('training', {}).get('val_split_ratio', 0.1)
     
     # Handle rectangular img_size for dataset
     # Dataset will output square images, model will crop to rectangular if needed
@@ -53,10 +97,16 @@ def create_dataloader(config: dict, split: str = 'train',
         # Dataset will output square images, we'll crop to rectangular in model if needed
         dataset_img_size = dataset_img_size[0]  # Use height
     
+    # For HO3D, we split train into train/val since evaluation has no full GT
+    if dataset_name == 'ho3d' and split in ['train', 'val']:
+        actual_split = 'train'  # Always load from train split
+    else:
+        actual_split = split
+    
     if dataset_name == 'ho3d':
         # HO3D dataset
         dataset = HO3DDataset(
-            data_split=split,
+            data_split=actual_split,
             root_dir=config['dataset']['root_dir'],
             dataset_version=config['dataset'].get('version', 'v3'),
             img_size=dataset_img_size,
@@ -69,24 +119,48 @@ def create_dataloader(config: dict, split: str = 'train',
             input_modal=config['dataset']['input_modal'],
             color_factor=config['dataset'].get('color_factor', 0.2),
             p_drop=config['dataset']['p_drop'],
-            train=(split == 'train')
+            train=(split == 'train')  # Use original split for train flag
         )
     else:
         # Dex-YCB dataset (default)
         dataset = DexYCBDataset(
             setup=config['dataset'].get('setup', 's0'),
             split=split,
-            root_dir=config['dataset']['root_dir'],
-            img_size=dataset_img_size,
-            aug_para=[
-                config['augmentation']['sigma_com'],
-                config['augmentation']['sigma_sc'],
-                config['augmentation']['rot_range']
-            ],
-            input_modal=config['dataset']['input_modal'],
-            p_drop=config['dataset']['p_drop'],
-            train=(split == 'train')
-        )
+        root_dir=config['dataset']['root_dir'],
+        img_size=dataset_img_size,
+        aug_para=[
+            config['augmentation']['sigma_com'],
+            config['augmentation']['sigma_sc'],
+            config['augmentation']['rot_range']
+        ],
+        input_modal=config['dataset']['input_modal'],
+        p_drop=config['dataset']['p_drop'],
+        train=(split == 'train')
+    )
+    
+    # Split train/val for HO3D (since evaluation split has no complete GT)
+    if dataset_name == 'ho3d' and split in ['train', 'val']:
+        total_size = len(dataset)
+        indices = list(range(total_size))
+        
+        # Use fixed random seed for reproducibility
+        import numpy as np
+        np.random.seed(42)
+        np.random.shuffle(indices)
+        
+        split_idx = int(total_size * (1 - val_split_ratio))
+        
+        if split == 'train':
+            indices = indices[:split_idx]
+        else:  # split == 'val'
+            indices = indices[split_idx:]
+        
+        # Use Subset to create train/val split
+        from torch.utils.data import Subset
+        dataset = Subset(dataset, indices)
+        
+        if rank == 0:
+            print(f"HO3D {split} split: {len(indices)} samples ({len(indices)/total_size*100:.1f}% of train split)")
     
     # Use DistributedSampler for distributed training
     if distributed:
@@ -275,21 +349,46 @@ def train_epoch(model: nn.Module, dataloader: DataLoader,
         predictions = model(rgb, depth, n_i)
         
         # Prepare targets (similar to WiLoR: directly use batch data, no None values)
-        # Extract only x, y coordinates from joint_img (which has shape (B, J, 3))
-        # Data loader always provides these, so we don't need None checks
+        # Prepare 2D keypoints with confidence (WiLoR format)
+        # Extract x, y coordinates from joint_img and add confidence = 1.0
         joint_img = batch['joint_img']  # (B, J, 3)
-        keypoints_2d = joint_img[:, :, :2].to(device)  # (B, J, 2) - extract x, y coordinates
+        keypoints_2d_xy = joint_img[:, :, :2].to(device)  # (B, J, 2)
+        batch_size, num_joints = keypoints_2d_xy.shape[:2]
+        confidence_2d = torch.ones(batch_size, num_joints, 1, device=device, dtype=keypoints_2d_xy.dtype)
+        keypoints_2d_with_conf = torch.cat([keypoints_2d_xy, confidence_2d], dim=-1)  # (B, J, 3)
+        
+        # Prepare 3D keypoints with confidence (WiLoR format)
+        keypoints_3d = batch['joints_3d_gt'].to(device)  # (B, J, 3)
+        confidence_3d = torch.ones(batch_size, num_joints, 1, device=device, dtype=keypoints_3d.dtype)
+        keypoints_3d_with_conf = torch.cat([keypoints_3d, confidence_3d], dim=-1)  # (B, J, 4)
         
         # Move all targets to device
         # Note: vertices are not provided in dataset, so we skip vertex loss
         # This is consistent with WiLoR which also doesn't use vertex loss directly
         targets = {
-            'keypoints_2d': keypoints_2d,
-            'keypoints_3d': batch['joints_3d_gt'].to(device),  # (B, J, 3)
+            'keypoints_2d': keypoints_2d_with_conf,  # (B, J, 3) with confidence
+            'keypoints_3d': keypoints_3d_with_conf,  # (B, J, 4) with confidence
             'vertices': None,  # Not available in dataset, vertex loss will be skipped
             'mano_pose': batch['mano_pose'].to(device),  # (B, 48)
             'mano_shape': batch['mano_shape'].to(device)  # (B, 10)
         }
+        
+        # Debug: Print data statistics for first few batches of first epoch
+        if rank == 0 and epoch == 0 and batch_idx < 3:
+            print(f'\n[Debug Batch {batch_idx}]')
+            print(f'  RGB range: [{rgb.min():.3f}, {rgb.max():.3f}]')
+            if depth is not None:
+                print(f'  Depth range: [{depth.min():.3f}, {depth.max():.3f}]')
+            print(f'  GT 3D joints (with conf) range: [{keypoints_3d_with_conf.min():.3f}, {keypoints_3d_with_conf.max():.3f}]')
+            print(f'  GT 3D joints (no conf) mean: {keypoints_3d.mean():.3f}, std: {keypoints_3d.std():.3f}')
+            print(f'  Pred 3D joints mean: {predictions["keypoints_3d"].mean():.3f}, std: {predictions["keypoints_3d"].std():.3f}')
+            print(f'  Pred 3D joints range: [{predictions["keypoints_3d"].min():.3f}, {predictions["keypoints_3d"].max():.3f}]')
+            print(f'  GT root joint (batch 0): {keypoints_3d[0, 0, :]}')
+            print(f'  Pred root joint (batch 0): {predictions["keypoints_3d"][0, 0, :]}')
+            
+            # Check if GT is already centered
+            gt_centered_by_root = keypoints_3d - keypoints_3d[:, [0], :]
+            print(f'  GT centered by root mean: {gt_centered_by_root.mean():.3f}, std: {gt_centered_by_root.std():.3f}')
         
         # Compute loss
         losses = criterion(predictions, targets)
@@ -298,6 +397,15 @@ def train_epoch(model: nn.Module, dataloader: DataLoader,
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
+        
+        # Gradient clipping (prevent gradient explosion)
+        # Get model parameters (handle DDP)
+        if isinstance(model, DDP):
+            model_params = model.module.parameters()
+        else:
+            model_params = model.parameters()
+        torch.nn.utils.clip_grad_norm_(model_params, max_norm=1.0)
+        
         optimizer.step()
         
         # Update statistics
@@ -306,8 +414,47 @@ def train_epoch(model: nn.Module, dataloader: DataLoader,
         
         # Logging (only on rank 0)
         if rank == 0 and batch_idx % log_freq == 0:
+            # Print detailed loss breakdown for diagnosis
+            loss_2d = losses.get('loss_2d', torch.tensor(0.0))
+            loss_3d_joint = losses.get('loss_3d_joint', torch.tensor(0.0))
+            loss_3d_vert = losses.get('loss_3d_vert', torch.tensor(0.0))
+            loss_aux = losses.get('loss_aux', torch.tensor(0.0))
+            # Prior loss may have sub-components (shape_prior, pose_prior)
+            loss_prior_shape = losses.get('shape_prior', torch.tensor(0.0))
+            loss_prior_pose = losses.get('pose_prior', torch.tensor(0.0))
+            total_loss_val = loss.item()
+            
+            # Convert to float if tensor
+            if isinstance(loss_2d, torch.Tensor):
+                loss_2d = loss_2d.item()
+            if isinstance(loss_3d_joint, torch.Tensor):
+                loss_3d_joint = loss_3d_joint.item()
+            if isinstance(loss_3d_vert, torch.Tensor):
+                loss_3d_vert = loss_3d_vert.item()
+            if isinstance(loss_aux, torch.Tensor):
+                loss_aux = loss_aux.item()
+            if isinstance(loss_prior_shape, torch.Tensor):
+                loss_prior_shape = loss_prior_shape.item()
+            if isinstance(loss_prior_pose, torch.Tensor):
+                loss_prior_pose = loss_prior_pose.item()
+            
+            print(f'\n[Epoch {epoch}, Iter {batch_idx}] Loss breakdown:')
+            print(f'  2D keypoint loss: {loss_2d:.4f}')
+            print(f'  3D joint loss: {loss_3d_joint:.4f}')
+            if loss_3d_vert > 0:
+                print(f'  3D vertex loss: {loss_3d_vert:.4f}')
+            print(f'  Prior loss (shape): {loss_prior_shape:.4f}')
+            if loss_prior_pose > 0:
+                print(f'  Prior loss (pose): {loss_prior_pose:.4f}')
+            print(f'  Aux loss: {loss_aux:.4f}')
+            print(f'  Total loss: {total_loss_val:.4f}')
+            
+            # Log to tensorboard
             for key, val in losses.items():
-                writer.add_scalar(f'Train/{key}', val.item(), epoch * len(dataloader) + batch_idx)
+                if isinstance(val, torch.Tensor):
+                    writer.add_scalar(f'Train/{key}', val.item(), epoch * len(dataloader) + batch_idx)
+                else:
+                    writer.add_scalar(f'Train/{key}', val, epoch * len(dataloader) + batch_idx)
         
         # Update progress bar (only on rank 0)
         if rank == 0:
@@ -327,8 +474,24 @@ def train_epoch(model: nn.Module, dataloader: DataLoader,
 
 def test(model: nn.Module, dataloader: DataLoader,
          criterion: nn.Module, device: torch.device, epoch: int,
-         writer: SummaryWriter, rank: int = 0, distributed: bool = False):
-    """Test model"""
+         writer: SummaryWriter, rank: int = 0, distributed: bool = False,
+         evaluator: Optional[Evaluator] = None):
+    """
+    Test model and compute evaluation metrics
+    
+    Args:
+        model: Model to test
+        dataloader: Test dataloader
+        criterion: Loss function
+        device: Device to run on
+        epoch: Current epoch
+        writer: TensorBoard writer
+        rank: Process rank (for distributed training)
+        distributed: Whether using distributed training
+        evaluator: Optional Evaluator instance for computing metrics
+    Returns:
+        dict: Dictionary containing test_loss, mpjpe, pa_mpjpe, and avg_metric
+    """
     model.eval()
     total_loss = 0.0
     num_batches = 0
@@ -337,9 +500,24 @@ def test(model: nn.Module, dataloader: DataLoader,
     if distributed and hasattr(dataloader.sampler, 'set_epoch'):
         dataloader.sampler.set_epoch(epoch)
     
+    # Initialize evaluator if not provided
+    if evaluator is None:
+        dataset_length = len(dataloader.dataset)
+        evaluator = Evaluator(
+            dataset_length=dataset_length,
+            keypoint_list=None,  # Use all keypoints
+            root_joint_idx=0,  # Wrist joint
+            metrics=['mpjpe', 'pa_mpjpe'],
+            save_predictions=False
+        )
+    
+    # Collect all predictions and GT for metric computation
+    all_pred_keypoints = []
+    all_gt_keypoints = []
+    
     with torch.no_grad():
         # Only show progress bar on rank 0
-        pbar = tqdm(dataloader, desc=f'Test {epoch}') if rank == 0 else dataloader
+        pbar = tqdm(dataloader, desc=f'Val {epoch}') if rank == 0 else dataloader
         for batch in pbar:
             rgb = batch['rgb'].to(device)
             depth = batch['depth'].to(device) if batch.get('depth') is not None else None
@@ -347,16 +525,24 @@ def test(model: nn.Module, dataloader: DataLoader,
             
             predictions = model(rgb, depth, n_i)
             
-            # Prepare targets (similar to WiLoR: directly use batch data, no None values)
-            # Extract only x, y coordinates from joint_img (which has shape (B, J, 3))
+            # Prepare 2D keypoints with confidence (WiLoR format)
+            # Extract x, y coordinates from joint_img and add confidence = 1.0
             joint_img = batch['joint_img']  # (B, J, 3)
-            keypoints_2d = joint_img[:, :, :2].to(device)  # (B, J, 2) - extract x, y coordinates
+            keypoints_2d_xy = joint_img[:, :, :2].to(device)  # (B, J, 2)
+            batch_size, num_joints = keypoints_2d_xy.shape[:2]
+            confidence_2d = torch.ones(batch_size, num_joints, 1, device=device, dtype=keypoints_2d_xy.dtype)
+            keypoints_2d_with_conf = torch.cat([keypoints_2d_xy, confidence_2d], dim=-1)  # (B, J, 3)
+            
+            # Prepare 3D keypoints with confidence (WiLoR format)
+            keypoints_3d = batch['joints_3d_gt'].to(device)  # (B, J, 3)
+            confidence_3d = torch.ones(batch_size, num_joints, 1, device=device, dtype=keypoints_3d.dtype)
+            keypoints_3d_with_conf = torch.cat([keypoints_3d, confidence_3d], dim=-1)  # (B, J, 4)
             
             # Move all targets to device
             # Note: vertices are not provided in dataset, so we skip vertex loss
             targets = {
-                'keypoints_2d': keypoints_2d,
-                'keypoints_3d': batch['joints_3d_gt'].to(device),  # (B, J, 3)
+                'keypoints_2d': keypoints_2d_with_conf,  # (B, J, 3) with confidence
+                'keypoints_3d': keypoints_3d_with_conf,  # (B, J, 4) with confidence
                 'vertices': None,  # Not available in dataset, vertex loss will be skipped
                 'mano_pose': batch['mano_pose'].to(device),  # (B, 48)
                 'mano_shape': batch['mano_shape'].to(device)  # (B, 10)
@@ -368,6 +554,14 @@ def test(model: nn.Module, dataloader: DataLoader,
             total_loss += loss.item()
             num_batches += 1
     
+            # Collect predictions and GT (remove confidence dimension)
+            pred_keypoints_3d = predictions['keypoints_3d']  # (B, J, 3) in mm
+            gt_keypoints_3d = targets['keypoints_3d'][:, :, :3]  # (B, J, 3) in mm - remove confidence
+            
+            # Store on CPU to save GPU memory
+            all_pred_keypoints.append(pred_keypoints_3d.cpu())
+            all_gt_keypoints.append(gt_keypoints_3d.cpu())
+    
     # Average loss across all processes
     if distributed:
         # Gather loss from all processes
@@ -377,11 +571,163 @@ def test(model: nn.Module, dataloader: DataLoader,
     else:
         avg_loss = total_loss / num_batches
     
-    # Log test loss (only on rank 0)
-    if rank == 0:
-        writer.add_scalar('Test/total_loss', avg_loss, epoch)
+    # Compute metrics with all predictions from all GPUs
+    metrics_dict = {}
     
-    return avg_loss
+    if distributed:
+        # Concatenate all batches from this process
+        local_pred = torch.cat(all_pred_keypoints, dim=0)  # (N_local, J, 3)
+        local_gt = torch.cat(all_gt_keypoints, dim=0)  # (N_local, J, 3)
+        
+        # Use all_gather to collect data from all processes
+        world_size = dist.get_world_size()
+        
+        # Gather sizes from all processes first
+        local_size = torch.tensor([local_pred.shape[0]], dtype=torch.long, device=device)
+        size_list = [torch.zeros(1, dtype=torch.long, device=device) for _ in range(world_size)]
+        dist.all_gather(size_list, local_size)
+        
+        # Only rank 0 computes metrics
+        if rank == 0:
+            # Gather predictions and GTs from all processes
+            all_preds_list = []
+            all_gts_list = []
+            
+            for i, size in enumerate(size_list):
+                num_samples = size.item()
+                if i == rank:
+                    # Use local data for rank 0
+                    all_preds_list.append(local_pred.cpu())
+                    all_gts_list.append(local_gt.cpu())
+                else:
+                    # Receive from other ranks
+                    recv_pred = torch.zeros(num_samples, local_pred.shape[1], local_pred.shape[2], 
+                                          dtype=local_pred.dtype, device=device)
+                    recv_gt = torch.zeros(num_samples, local_gt.shape[1], local_gt.shape[2],
+                                        dtype=local_gt.dtype, device=device)
+                    dist.recv(recv_pred, src=i)
+                    dist.recv(recv_gt, src=i)
+                    all_preds_list.append(recv_pred.cpu())
+                    all_gts_list.append(recv_gt.cpu())
+            
+            # Concatenate all data
+            all_pred = torch.cat(all_preds_list, dim=0)  # (N_total, J, 3)
+            all_gt = torch.cat(all_gts_list, dim=0)  # (N_total, J, 3)
+            
+            # Compute metrics directly without using Evaluator's array storage
+            # This avoids array size mismatch issues
+            from metrics.pose_metrics import compute_mpjpe, compute_pa_mpjpe
+            
+            # Center at root joint (wrist = index 0)
+            all_pred_centered = all_pred - all_pred[:, [0], :]
+            all_gt_centered = all_gt - all_gt[:, [0], :]
+            
+            # Filter invalid samples
+            gt_var = all_gt_centered.var(dim=(1, 2))
+            finite_mask = torch.isfinite(all_gt_centered).all(dim=(1, 2))
+            valid_mask = (gt_var > 1e-8) & finite_mask
+            
+            if valid_mask.any():
+                all_pred_valid = all_pred_centered[valid_mask].to(device)
+                all_gt_valid = all_gt_centered[valid_mask].to(device)
+                
+                # Compute metrics on all valid samples at once
+                mpjpe_array = compute_mpjpe(all_pred_valid, all_gt_valid)  # (N_valid,)
+                pa_mpjpe_array = compute_pa_mpjpe(all_pred_valid, all_gt_valid)  # (N_valid,)
+                
+                # Average over all valid samples
+                mpjpe = float(mpjpe_array.mean())
+                pa_mpjpe = float(pa_mpjpe_array.mean())
+                avg_metric = (mpjpe + pa_mpjpe) / 2.0
+            else:
+                mpjpe = float('inf')
+                pa_mpjpe = float('inf')
+                avg_metric = float('inf')
+            
+            metrics_dict = {
+                'test_loss': avg_loss,
+                'mpjpe': mpjpe,
+                'pa_mpjpe': pa_mpjpe,
+                'avg_metric': avg_metric
+            }
+            
+            # Log to tensorboard
+            writer.add_scalar('Val/total_loss', avg_loss, epoch)
+            writer.add_scalar('Val/mpjpe', mpjpe, epoch)
+            writer.add_scalar('Val/pa_mpjpe', pa_mpjpe, epoch)
+            writer.add_scalar('Val/avg_metric', avg_metric, epoch)
+            
+            print(f'  Evaluated on {all_pred.shape[0]} samples from all {world_size} GPUs')
+        else:
+            # Non-rank-0 processes: send data to rank 0
+            dist.send(local_pred.to(device), dst=0)
+            dist.send(local_gt.to(device), dst=0)
+            
+            # Return dummy values
+            metrics_dict = {
+                'test_loss': avg_loss,
+                'mpjpe': float('inf'),
+                'pa_mpjpe': float('inf'),
+                'avg_metric': float('inf')
+            }
+    else:
+        # Single GPU mode - concatenate and evaluate all data
+        if rank == 0:
+            all_pred = torch.cat(all_pred_keypoints, dim=0)  # (N, J, 3)
+            all_gt = torch.cat(all_gt_keypoints, dim=0)  # (N, J, 3)
+            
+            # Compute metrics directly without using Evaluator's array storage
+            from metrics.pose_metrics import compute_mpjpe, compute_pa_mpjpe
+            
+            # Center at root joint (wrist = index 0)
+            all_pred_centered = all_pred - all_pred[:, [0], :]
+            all_gt_centered = all_gt - all_gt[:, [0], :]
+            
+            # Filter invalid samples
+            gt_var = all_gt_centered.var(dim=(1, 2))
+            finite_mask = torch.isfinite(all_gt_centered).all(dim=(1, 2))
+            valid_mask = (gt_var > 1e-8) & finite_mask
+            
+            if valid_mask.any():
+                all_pred_valid = all_pred_centered[valid_mask].to(device)
+                all_gt_valid = all_gt_centered[valid_mask].to(device)
+                
+                # Compute metrics on all valid samples at once
+                mpjpe_array = compute_mpjpe(all_pred_valid, all_gt_valid)  # (N_valid,)
+                pa_mpjpe_array = compute_pa_mpjpe(all_pred_valid, all_gt_valid)  # (N_valid,)
+                
+                # Average over all valid samples
+                mpjpe = float(mpjpe_array.mean())
+                pa_mpjpe = float(pa_mpjpe_array.mean())
+                avg_metric = (mpjpe + pa_mpjpe) / 2.0
+            else:
+                mpjpe = float('inf')
+                pa_mpjpe = float('inf')
+                avg_metric = float('inf')
+            
+            metrics_dict = {
+                'test_loss': avg_loss,
+                'mpjpe': mpjpe,
+                'pa_mpjpe': pa_mpjpe,
+                'avg_metric': avg_metric
+            }
+            
+            # Log to tensorboard
+            writer.add_scalar('Val/total_loss', avg_loss, epoch)
+            writer.add_scalar('Val/mpjpe', mpjpe, epoch)
+            writer.add_scalar('Val/pa_mpjpe', pa_mpjpe, epoch)
+            writer.add_scalar('Val/avg_metric', avg_metric, epoch)
+            
+            print(f'  Evaluated on {all_pred.shape[0]} samples')
+        else:
+            metrics_dict = {
+                'test_loss': avg_loss,
+                'mpjpe': float('inf'),
+                'pa_mpjpe': float('inf'),
+                'avg_metric': float('inf')
+            }
+    
+    return metrics_dict
 
 
 def setup_distributed(backend='nccl'):
@@ -474,8 +820,8 @@ def main():
         print('Creating data loaders...')
     train_loader = create_dataloader(config, split='train', 
                                      distributed=distributed, rank=rank, world_size=world_size)
-    test_loader = create_dataloader(config, split='test',
-                                    distributed=distributed, rank=rank, world_size=world_size)
+    val_loader = create_dataloader(config, split='val',
+                                   distributed=distributed, rank=rank, world_size=world_size)
     
     # Create model
     if rank == 0:
@@ -539,6 +885,23 @@ def main():
     test_freq = config['training']['test_freq']
     log_freq = config['logging']['log_freq']
     
+    # Initialize evaluator for validation set (only on rank 0)
+    if rank == 0:
+        val_dataset_length = len(val_loader.dataset)
+        val_evaluator = Evaluator(
+            dataset_length=val_dataset_length,
+            keypoint_list=None,  # Use all keypoints
+            root_joint_idx=0,  # Wrist joint
+            metrics=['mpjpe', 'pa_mpjpe'],
+            save_predictions=False
+        )
+    else:
+        val_evaluator = None
+    
+    # Track best average metric (mpjpe + pa_mpjpe) / 2
+    best_avg_metric = float('inf')
+    best_epoch = -1
+    
     if rank == 0:
         print('Starting training...')
     
@@ -554,16 +917,50 @@ def main():
             if scheduler is not None:
                 scheduler.step()
             
-            # Test
-            if (epoch + 1) % test_freq == 0:
-                test_loss = test(model, test_loader, criterion, device, epoch, writer, rank, distributed)
-                if rank == 0:
-                    print(f'Epoch {epoch}: Train Loss = {train_loss:.4f}, Test Loss = {test_loss:.4f}')
-            else:
-                if rank == 0:
-                    print(f'Epoch {epoch}: Train Loss = {train_loss:.4f}')
+            # Validation every epoch
+            # Note: test() function will reset evaluator.counter internally
+            val_metrics = test(model, val_loader, criterion, device, epoch, writer, 
+                              rank, distributed, evaluator=val_evaluator)
             
-            # Save checkpoint (only on rank 0)
+            if rank == 0:
+                current_lr = optimizer.param_groups[0]['lr']
+                val_loss = val_metrics.get('test_loss', float('inf'))
+                mpjpe = val_metrics.get('mpjpe', float('inf'))
+                pa_mpjpe = val_metrics.get('pa_mpjpe', float('inf'))
+                avg_metric = val_metrics.get('avg_metric', float('inf'))
+                
+                print(f'\nEpoch {epoch}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}, LR = {current_lr:.2e}')
+                print(f'  MPJPE: {mpjpe:.3f} mm, PA-MPJPE: {pa_mpjpe:.3f} mm, Avg Metric: {avg_metric:.3f} mm')
+                
+                # Save best model based on average metric (mpjpe + pa_mpjpe) / 2
+                if avg_metric < best_avg_metric:
+                    best_avg_metric = avg_metric
+                    best_epoch = epoch
+                    
+                    # Get model state dict (handle DDP)
+                    if distributed:
+                        best_model_state_dict = model_module.state_dict()
+                    else:
+                        best_model_state_dict = model.state_dict()
+                    
+                    best_checkpoint = {
+                        'epoch': epoch,
+                        'model_state_dict': best_model_state_dict,
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'train_loss': train_loss,
+                        'val_loss': val_loss,
+                        'mpjpe': mpjpe,
+                        'pa_mpjpe': pa_mpjpe,
+                        'avg_metric': avg_metric,
+                    }
+                    if scheduler is not None:
+                        best_checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+                    
+                    best_checkpoint_path = save_dir / 'best_model.pth'
+                    torch.save(best_checkpoint, best_checkpoint_path)
+                    print(f'  ✓ Saved best model (avg_metric={avg_metric:.3f} mm) to {best_checkpoint_path}')
+            
+            # Save regular checkpoint (only on rank 0, based on save_freq)
             if rank == 0 and (epoch + 1) % save_freq == 0:
                 # Get model state dict (handle DDP)
                 if distributed:
@@ -592,6 +989,7 @@ def main():
             final_path = save_dir / 'final_model.pth'
             torch.save(model_state_dict, final_path)
             print(f'Saved final model to {final_path}')
+            print(f'Best model: Epoch {best_epoch}, Avg Metric = {best_avg_metric:.3f} mm')
     finally:
         # Cleanup distributed training
         cleanup_distributed()

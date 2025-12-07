@@ -124,7 +124,7 @@ class UTNet(nn.Module):
                     model_type='mano',
                     gender='neutral',
                     num_hand_joints=num_hand_joints,
-                    use_pca=True,
+                    use_pca=False,  # Don't use PCA - we provide full 45-dim axis-angle
                     flat_hand_mean=True
                 )
                 from ..utils.mano_utils import MANOWrapper
@@ -365,13 +365,13 @@ class UTNet(nn.Module):
                               cam_params: torch.Tensor) -> torch.Tensor:
         """
         Project 3D joints to 2D keypoints using WiLoR-style perspective projection
-        Normalized to [-1, 1] to match dataset format
+        Normalized to [-0.5, 0.5] to match dataset format
         
         Args:
             joints: (B, J, 3) 3D joints in millimeters
             cam_params: (B, 3) camera parameters [scale, tx, ty] from model
         Returns:
-            keypoints_2d: (B, J, 2) 2D keypoints normalized to [-1, 1]
+            keypoints_2d: (B, J, 2) 2D keypoints normalized to [-0.5, 0.5]
         """
         B, J, _ = joints.shape
         device = joints.device

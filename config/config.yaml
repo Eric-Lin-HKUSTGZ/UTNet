@@ -49,7 +49,7 @@ loss:
   w_3d_vert: 0.0
   w_prior: 0.001
   w_aux: 0.001
-  use_vertex_loss: true
+  use_vertex_loss: false
   use_aux_loss: true
 
 # Training
@@ -64,6 +64,7 @@ training:
   log_dir: "./logs"
   save_freq: 10  # Save checkpoint every N epochs
   test_freq: 5  # Test every N epochs
+  val_split_ratio: 0.1  # 10% of train split for validation (only for HO3D)
 
 # Optimizer
 optimizer:

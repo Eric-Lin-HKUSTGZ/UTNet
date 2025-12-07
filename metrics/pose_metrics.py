@@ -32,6 +32,7 @@ def compute_similarity_transform(S1: torch.Tensor, S2: torch.Tensor) -> torch.Te
 
     # 2. Compute variance of X1 used for scale.
     var1 = (X1**2).sum(dim=(1, 2))  # (B,)
+    var1 = torch.clamp(var1, min=1e-8)  # avoid divide-by-zero
 
     # 3. The outer product of X1 and X2.
     K = torch.matmul(X1, X2.permute(0, 2, 1))  # (B, 3, 3)
@@ -76,12 +77,10 @@ def compute_similarity_transform(S1: torch.Tensor, S2: torch.Tensor) -> torch.Te
 def compute_mpjpe(pred_joints: torch.Tensor, gt_joints: torch.Tensor) -> np.ndarray:
     """
     Compute Mean Per Joint Position Error (MPJPE) in mm.
-    
-    Args:
-        pred_joints (torch.Tensor): Predicted 3D joints of shape (B, N, 3) or (N, 3).
-        gt_joints (torch.Tensor): Ground truth 3D joints of shape (B, N, 3) or (N, 3).
-    Returns:
-        (np.ndarray): MPJPE in mm, shape (B,) or scalar.
+
+    Notes:
+        - Inputs are assumed to be in millimeters already (model + dataloader use mm)
+        - Guard against degenerate cases (all-zero joints) to avoid NaN/Inf.
     """
     # Handle single sample case
     if pred_joints.dim() == 2:
@@ -90,16 +89,28 @@ def compute_mpjpe(pred_joints: torch.Tensor, gt_joints: torch.Tensor) -> np.ndar
         squeeze_output = True
     else:
         squeeze_output = False
-    
+
+    # Guard against NaN/Inf in inputs
+    pred_joints = torch.where(torch.isfinite(pred_joints), pred_joints, torch.zeros_like(pred_joints))
+    gt_joints = torch.where(torch.isfinite(gt_joints), gt_joints, torch.zeros_like(gt_joints))
+
+    # If gt variance is ~0 (e.g., all zeros), return zeros to avoid NaN
+    var_gt = gt_joints.var(dim=(1, 2))
+    valid_mask = var_gt > 1e-8
+    if not valid_mask.any():
+        zeros = torch.zeros((pred_joints.shape[0],), device=pred_joints.device)
+        out = zeros.cpu().numpy()
+        return out[0] if squeeze_output else out
+
     # Compute Euclidean distance for each joint
-    joint_errors = torch.sqrt(((pred_joints - gt_joints) ** 2).sum(dim=-1))  # (B, N)
-    
+    joint_errors = torch.sqrt(torch.clamp(((pred_joints - gt_joints) ** 2).sum(dim=-1), min=1e-12))  # (B, N)
+
     # Mean over joints
     mpjpe = joint_errors.mean(dim=-1)  # (B,)
-    
-    # Convert to mm and numpy
-    mpjpe_mm = (1000 * mpjpe).cpu().numpy()
-    
+
+    # Keep in mm (inputs already mm)
+    mpjpe_mm = mpjpe.cpu().numpy()
+
     if squeeze_output:
         return mpjpe_mm[0]
     return mpjpe_mm
@@ -108,13 +119,7 @@ def compute_mpjpe(pred_joints: torch.Tensor, gt_joints: torch.Tensor) -> np.ndar
 def compute_pa_mpjpe(pred_joints: torch.Tensor, gt_joints: torch.Tensor) -> np.ndarray:
     """
     Compute Procrustes Aligned Mean Per Joint Position Error (PA-MPJPE) in mm.
-    This is also called Reconstruction Error (RE).
-    
-    Args:
-        pred_joints (torch.Tensor): Predicted 3D joints of shape (B, N, 3) or (N, 3).
-        gt_joints (torch.Tensor): Ground truth 3D joints of shape (B, N, 3) or (N, 3).
-    Returns:
-        (np.ndarray): PA-MPJPE in mm, shape (B,) or scalar.
+    Guard against degenerate cases (zero variance) to avoid NaN.
     """
     # Handle single sample case
     if pred_joints.dim() == 2:
@@ -123,19 +128,31 @@ def compute_pa_mpjpe(pred_joints: torch.Tensor, gt_joints: torch.Tensor) -> np.n
         squeeze_output = True
     else:
         squeeze_output = False
-    
+
+    # Guard against NaN/Inf
+    pred_joints = torch.where(torch.isfinite(pred_joints), pred_joints, torch.zeros_like(pred_joints))
+    gt_joints = torch.where(torch.isfinite(gt_joints), gt_joints, torch.zeros_like(gt_joints))
+
+    # Check variance; if degenerate, return zeros
+    var_gt = gt_joints.var(dim=(1, 2))
+    valid_mask = var_gt > 1e-8
+    if not valid_mask.any():
+        zeros = torch.zeros((pred_joints.shape[0],), device=pred_joints.device)
+        out = zeros.cpu().numpy()
+        return out[0] if squeeze_output else out
+
     # Apply Procrustes alignment
     pred_joints_aligned = compute_similarity_transform(pred_joints, gt_joints)  # (B, N, 3)
-    
+
     # Compute Euclidean distance after alignment
-    joint_errors = torch.sqrt(((pred_joints_aligned - gt_joints) ** 2).sum(dim=-1))  # (B, N)
-    
+    joint_errors = torch.sqrt(torch.clamp(((pred_joints_aligned - gt_joints) ** 2).sum(dim=-1), min=1e-12))  # (B, N)
+
     # Mean over joints
     pa_mpjpe = joint_errors.mean(dim=-1)  # (B,)
-    
-    # Convert to mm and numpy
-    pa_mpjpe_mm = (1000 * pa_mpjpe).cpu().numpy()
-    
+
+    # Keep in mm (inputs already mm)
+    pa_mpjpe_mm = pa_mpjpe.cpu().numpy()
+
     if squeeze_output:
         return pa_mpjpe_mm[0]
     return pa_mpjpe_mm

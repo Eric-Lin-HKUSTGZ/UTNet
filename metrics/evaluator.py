@@ -116,9 +116,25 @@ class Evaluator:
         batch_size = pred_keypoints_3d.shape[0]
         device = pred_keypoints_3d.device
         
+        # Initialize batch metrics dictionary
+        batch_metrics = {}
+        
         # Center predictions and ground truth at root joint (wrist)
         pred_keypoints_3d_centered = pred_keypoints_3d - pred_keypoints_3d[:, [self.root_joint_idx], :]
         gt_keypoints_3d_centered = gt_keypoints_3d - gt_keypoints_3d[:, [self.root_joint_idx], :]
+
+        # Filter invalid samples: zero variance or non-finite GT
+        gt_var = gt_keypoints_3d_centered.var(dim=(1, 2))
+        finite_mask = torch.isfinite(gt_keypoints_3d_centered).all(dim=(1, 2))
+        valid_mask = (gt_var > 1e-8) & finite_mask
+
+        if not valid_mask.any():
+            # No valid samples in this batch; skip counting
+            return batch_metrics
+
+        pred_keypoints_3d_centered = pred_keypoints_3d_centered[valid_mask]
+        gt_keypoints_3d_centered = gt_keypoints_3d_centered[valid_mask]
+        batch_size = pred_keypoints_3d_centered.shape[0]
         
         # Select keypoints if keypoint_list is specified
         if self.keypoint_list is not None:
@@ -126,16 +142,25 @@ class Evaluator:
             gt_keypoints_3d_centered = gt_keypoints_3d_centered[:, self.keypoint_list, :]
         
         # Compute metrics
-        batch_metrics = {}
-        
         if 'mpjpe' in self.metrics:
             mpjpe = compute_mpjpe(pred_keypoints_3d_centered, gt_keypoints_3d_centered)
-            self.mpjpe[self.counter:self.counter+batch_size] = mpjpe
+            # Ensure we don't exceed array bounds
+            # mpjpe is a numpy array of shape (batch_size,)
+            end_idx = min(self.counter + batch_size, self.dataset_length)
+            actual_size = end_idx - self.counter
+            if actual_size > 0:
+                # Only store what fits in the array
+                self.mpjpe[self.counter:end_idx] = mpjpe[:actual_size]
             batch_metrics['mpjpe'] = mpjpe
         
         if 'pa_mpjpe' in self.metrics:
             pa_mpjpe = compute_pa_mpjpe(pred_keypoints_3d_centered, gt_keypoints_3d_centered)
-            self.pa_mpjpe[self.counter:self.counter+batch_size] = pa_mpjpe
+            # Ensure we don't exceed array bounds
+            end_idx = min(self.counter + batch_size, self.dataset_length)
+            actual_size = end_idx - self.counter
+            if actual_size > 0:
+                # Only store what fits in the array
+                self.pa_mpjpe[self.counter:end_idx] = pa_mpjpe[:actual_size]
             batch_metrics['pa_mpjpe'] = pa_mpjpe
         
         # Save predictions if requested
@@ -147,7 +172,8 @@ class Evaluator:
             if gt_vertices is not None:
                 self.gt_vertices.append(gt_vertices.cpu().numpy())
         
-        self.counter += batch_size
+        # Only increment counter by the amount we actually stored
+        self.counter += min(batch_size, actual_size if 'mpjpe' in self.metrics else batch_size)
         
         return batch_metrics
 

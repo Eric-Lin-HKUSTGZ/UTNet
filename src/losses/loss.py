@@ -17,50 +17,29 @@ class Keypoint2DLoss(nn.Module):
         Args:
             loss_type: 'l1' or 'l2' loss
         """
-        super().__init__()
+        super(Keypoint2DLoss, self).__init__()
         if loss_type == 'l1':
             self.loss_fn = nn.L1Loss(reduction='none')
         elif loss_type == 'l2':
             self.loss_fn = nn.MSELoss(reduction='none')
         else:
-            raise ValueError(f"Unsupported loss_type: {loss_type}")
+            raise NotImplementedError('Unsupported loss function')
 
-    def forward(self, pred_keypoints_2d: torch.Tensor, 
-                gt_keypoints_2d: torch.Tensor,
-                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, pred_keypoints_2d: torch.Tensor, gt_keypoints_2d: torch.Tensor) -> torch.Tensor:
         """
-        Compute 2D reprojection loss on the keypoints (WiLoR style).
+        Compute 2D reprojection loss on the keypoints.
         Args:
-            pred_keypoints_2d: (B, N, 2) predicted 2D keypoints
-            gt_keypoints_2d: (B, N, 2) or (B, N, 3) ground truth 2D keypoints
-                            If (B, N, 3), last dimension is confidence
-            mask: (B, N) optional visibility mask (alternative to confidence in gt)
+            pred_keypoints_2d (torch.Tensor): Tensor of shape [B, N, 2] or [B, S, N, 2] containing projected 2D keypoints
+                                               (B: batch_size, S: num_samples, N: num_keypoints)
+            gt_keypoints_2d (torch.Tensor): Tensor of shape [B, N, 3] or [B, S, N, 3] containing the ground truth 2D keypoints and confidence.
         Returns:
-            loss: scalar loss value
+            torch.Tensor: 2D keypoint loss.
         """
-        # Check if gt has confidence in last dimension
-        if gt_keypoints_2d.shape[-1] == 3:
-            # Extract confidence and 2D coordinates (WiLoR style)
-            conf = gt_keypoints_2d[:, :, -1].unsqueeze(-1).clone()  # (B, N, 1)
-            gt_keypoints_2d = gt_keypoints_2d[:, :, :2]  # (B, N, 2)
-        elif mask is not None:
-            # Use mask as confidence
-            conf = mask.unsqueeze(-1).float()  # (B, N, 1)
-        else:
-            # No confidence, use all keypoints (confidence = 1.0)
-            conf = torch.ones(pred_keypoints_2d.shape[0], pred_keypoints_2d.shape[1], 1, 
-                            device=pred_keypoints_2d.device, dtype=pred_keypoints_2d.dtype)
-        
-        # Compute per-element loss (WiLoR style: reduction='none')
-        loss_per_element = self.loss_fn(pred_keypoints_2d, gt_keypoints_2d)  # (B, N, 2)
-        
-        # Apply confidence weighting (WiLoR style)
-        loss_weighted = (conf * loss_per_element).sum(dim=(1, 2))  # (B,)
-        
-        # Sum over batch (WiLoR style)
-        loss = loss_weighted.sum()
-        
-        return loss
+        # Extract confidence from last dimension
+        conf = gt_keypoints_2d[:, :, -1].unsqueeze(-1).clone()
+        # Compute loss with confidence weighting
+        loss = (conf * self.loss_fn(pred_keypoints_2d, gt_keypoints_2d[:, :, :-1])).sum(dim=(1,2))
+        return loss.sum()
 
 
 class Keypoint3DLoss(nn.Module):
@@ -69,62 +48,62 @@ class Keypoint3DLoss(nn.Module):
     L_3D_joint = ||(J_3D_pred - J_root_pred) - (J_3D_gt - J_root_gt)||_1 with confidence weighting
     This removes global translation and focuses on relative joint positions.
     """
-    def __init__(self, loss_type: str = 'l1', root_id: int = 0):
+    def __init__(self, loss_type: str = 'l1'):
         """
         Args:
             loss_type: 'l1' or 'l2' loss
-            root_id: index of root joint (wrist) for relative positioning
         """
-        super().__init__()
-        self.root_id = root_id
+        super(Keypoint3DLoss, self).__init__()
         if loss_type == 'l1':
             self.loss_fn = nn.L1Loss(reduction='none')
         elif loss_type == 'l2':
             self.loss_fn = nn.MSELoss(reduction='none')
         else:
-            raise ValueError(f"Unsupported loss_type: {loss_type}")
+            raise NotImplementedError('Unsupported loss function')
 
-    def forward(self, pred_keypoints_3d: torch.Tensor,
-                gt_keypoints_3d: torch.Tensor,
-                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, pred_keypoints_3d: torch.Tensor, gt_keypoints_3d: torch.Tensor, pelvis_id: int = 0):
         """
-        Compute 3D keypoint loss (WiLoR style).
+        Compute 3D keypoint loss.
         Args:
-            pred_keypoints_3d: (B, N, 3) predicted 3D keypoints in absolute coordinates
-            gt_keypoints_3d: (B, N, 3) or (B, N, 4) ground truth 3D keypoints in absolute coordinates
-                            If (B, N, 4), last dimension is confidence
-            mask: (B, N) optional visibility mask (alternative to confidence in gt)
+            pred_keypoints_3d (torch.Tensor): Tensor of shape [B, N, 3] or [B, S, N, 3] containing the predicted 3D keypoints
+                                               (B: batch_size, S: num_samples, N: num_keypoints)
+            gt_keypoints_3d (torch.Tensor): Tensor of shape [B, N, 4] or [B, S, N, 4] containing the ground truth 3D keypoints and confidence.
+            pelvis_id (int): Index of root joint (wrist for hand, pelvis for body). Default is 0.
         Returns:
-            loss: scalar loss value
+            torch.Tensor: 3D keypoint loss.
         """
-        # Check if gt has confidence in last dimension
-        if gt_keypoints_3d.shape[-1] == 4:
-            # Extract confidence and 3D coordinates (WiLoR style)
-            conf = gt_keypoints_3d[:, :, -1].unsqueeze(-1).clone()  # (B, N, 1)
-            gt_keypoints_3d = gt_keypoints_3d[:, :, :3]  # (B, N, 3)
-        elif mask is not None:
-            # Use mask as confidence
-            conf = mask.unsqueeze(-1).float()  # (B, N, 1)
-        else:
-            # No confidence, use all keypoints (confidence = 1.0)
-            conf = torch.ones(pred_keypoints_3d.shape[0], pred_keypoints_3d.shape[1], 1, 
-                            device=pred_keypoints_3d.device, dtype=pred_keypoints_3d.dtype)
+        batch_size = pred_keypoints_3d.shape[0]
+        gt_keypoints_3d = gt_keypoints_3d.clone()
         
-        # WiLoR style: normalize by subtracting root joint (pelvis_id=0 for hand, it's the wrist)
-        # This removes global translation and focuses on relative joint positions
-        pred_relative = pred_keypoints_3d - pred_keypoints_3d[:, self.root_id:self.root_id+1, :]  # (B, N, 3)
-        gt_relative = gt_keypoints_3d - gt_keypoints_3d[:, self.root_id:self.root_id+1, :]  # (B, N, 3)
+        # Debug: print statistics (controlled by environment variable)
+        import os
+        if os.environ.get('UTNET_DEBUG_LOSS', '0') == '1':
+            print(f'[Debug 3D Loss]')
+            print(f'  Before centering - Pred mean: {pred_keypoints_3d.mean():.3f}, std: {pred_keypoints_3d.std():.3f}')
+            print(f'  Before centering - GT mean: {gt_keypoints_3d[:, :, :-1].mean():.3f}, std: {gt_keypoints_3d[:, :, :-1].std():.3f}')
         
-        # Compute per-element loss (WiLoR style: reduction='none')
-        loss_per_element = self.loss_fn(pred_relative, gt_relative)  # (B, N, 3)
+        # Normalize by subtracting root joint (removes global translation)
+        pred_keypoints_3d = pred_keypoints_3d - pred_keypoints_3d[:, pelvis_id, :].unsqueeze(dim=1)
+        gt_keypoints_3d[:, :, :-1] = gt_keypoints_3d[:, :, :-1] - gt_keypoints_3d[:, pelvis_id, :-1].unsqueeze(dim=1)
         
-        # Apply confidence weighting (WiLoR style)
-        loss_weighted = (conf * loss_per_element).sum(dim=(1, 2))  # (B,)
+        # Extract confidence
+        conf = gt_keypoints_3d[:, :, -1].unsqueeze(-1).clone()
+        gt_keypoints_3d = gt_keypoints_3d[:, :, :-1]
         
-        # Sum over batch (WiLoR style)
-        loss = loss_weighted.sum()
+        # Debug: print after centering
+        if os.environ.get('UTNET_DEBUG_LOSS', '0') == '1':
+            print(f'  After centering - Pred mean: {pred_keypoints_3d.mean():.3f}, std: {pred_keypoints_3d.std():.3f}')
+            print(f'  After centering - GT mean: {gt_keypoints_3d.mean():.3f}, std: {gt_keypoints_3d.std():.3f}')
+            per_element_loss = self.loss_fn(pred_keypoints_3d, gt_keypoints_3d)
+            print(f'  Per-element loss mean: {per_element_loss.mean():.3f}, max: {per_element_loss.max():.3f}')
         
-        return loss
+        # Compute loss with confidence weighting
+        loss = (conf * self.loss_fn(pred_keypoints_3d, gt_keypoints_3d)).sum(dim=(1,2))
+        
+        if os.environ.get('UTNET_DEBUG_LOSS', '0') == '1':
+            print(f'  Loss value: {loss.sum().item():.3f}')
+        
+        return loss.sum()
 
 
 class Vertex3DLoss(nn.Module):
@@ -256,7 +235,7 @@ class UTNetLoss(nn.Module):
         
         # Initialize loss modules (WiLoR style)
         self.loss_2d = Keypoint2DLoss(loss_type='l1')  # WiLoR uses L1 for 2D
-        self.loss_3d_joint = Keypoint3DLoss(loss_type='l1', root_id=0)  # WiLoR uses L1 for 3D, root_id=0 (wrist)
+        self.loss_3d_joint = Keypoint3DLoss(loss_type='l1')  # WiLoR uses L1 for 3D
         if use_vertex_loss:
             self.loss_3d_vert = Vertex3DLoss()
         self.loss_prior = MANOParameterPrior()

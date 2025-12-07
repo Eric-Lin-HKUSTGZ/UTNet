@@ -351,6 +351,43 @@ class MANOWrapper(nn.Module):
         keypoints_21[:, 20] = fingertips[:, 4]  # pinky tip
         
         return keypoints_21
+    
+    def _rotation_matrix_to_axis_angle(self, rotation_matrix: torch.Tensor) -> torch.Tensor:
+        """
+        Convert rotation matrix to axis-angle representation
+        
+        Args:
+            rotation_matrix: (B, 3, 3) rotation matrices
+        Returns:
+            axis_angle: (B, 3) axis-angle vectors
+        """
+        # Use PyTorch3D-style conversion if available, otherwise use simple method
+        batch_size = rotation_matrix.shape[0]
+        device = rotation_matrix.device
+        
+        # Compute the angle
+        trace = rotation_matrix[:, 0, 0] + rotation_matrix[:, 1, 1] + rotation_matrix[:, 2, 2]
+        angle = torch.acos(torch.clamp((trace - 1) / 2, -1 + 1e-7, 1 - 1e-7))
+        
+        # Compute the axis
+        # For small angles, use simplified formula to avoid numerical issues
+        small_angle_mask = angle.abs() < 1e-3
+        
+        axis = torch.zeros(batch_size, 3, device=device)
+        
+        # For non-small angles
+        if (~small_angle_mask).any():
+            r = rotation_matrix[~small_angle_mask]
+            axis[~small_angle_mask] = torch.stack([
+                r[:, 2, 1] - r[:, 1, 2],
+                r[:, 0, 2] - r[:, 2, 0],
+                r[:, 1, 0] - r[:, 0, 1]
+            ], dim=1) / (2 * torch.sin(angle[~small_angle_mask]).unsqueeze(1))
+        
+        # Axis-angle = angle * axis
+        axis_angle = angle.unsqueeze(1) * axis
+        
+        return axis_angle
 
     def forward(self, global_orient: torch.Tensor,
                 hand_pose: torch.Tensor,
@@ -365,15 +402,26 @@ class MANOWrapper(nn.Module):
         Returns:
             dict with 'vertices', 'joints' (21 keypoints), etc.
         """
-        # Convert rotation matrices to axis-angle if needed
-        # For now, assume MANO accepts rotation matrices directly
-        # In practice, may need to convert to axis-angle
+        # Convert rotation matrices to axis-angle
+        # smplx MANO with use_pca=True expects axis-angle input
+        batch_size = global_orient.shape[0]
         
+        # Convert global_orient: (B, 1, 3, 3) -> (B, 3)
+        global_orient_aa = self._rotation_matrix_to_axis_angle(
+            global_orient.reshape(batch_size, 3, 3)
+        )  # (B, 3)
+        
+        # Convert hand_pose: (B, 15, 3, 3) -> (B, 45)
+        hand_pose_aa = self._rotation_matrix_to_axis_angle(
+            hand_pose.reshape(batch_size * 15, 3, 3)
+        ).reshape(batch_size, 45)  # (B, 45)
+        
+        # Call MANO with axis-angle inputs
         mano_output = self.mano(
-            global_orient=global_orient,
-            hand_pose=hand_pose,
-            betas=betas,
-            pose2rot=False  # Already rotation matrices
+            global_orient=global_orient_aa,  # (B, 3)
+            hand_pose=hand_pose_aa,  # (B, 45)
+            betas=betas,  # (B, 10)
+            pose2rot=True  # Convert axis-angle to rotation matrices internally
         )
         
         # Extend 16 joints to 21 keypoints
