@@ -1,0 +1,94 @@
+# UTNet Configuration File
+
+# Dataset
+dataset:
+  name: "HO3D"  # "DexYCB" or "HO3D"
+  root_dir: "/data1/users/Robert/datasets"  # Update with actual path
+  setup: "s0"  # Dex-YCB setup (only used for DexYCB)
+  split: "train"  # or "test"
+  img_size: [256, 192]  # Rectangular input: (height, width) to match WiLoR and pretrained model
+  input_modal: "RGBD"
+  p_drop: 0.4  # Probability to drop depth (OmniVGGT style)
+  # HO3D specific options
+  version: "v3"  # HO3D dataset version (only used for HO3D)
+  cube_size: [280, 280, 280]  # Cube size for cropping (only used for HO3D)
+  color_factor: 0.2  # Color augmentation factor (only used for HO3D)
+
+# Model
+model:
+  img_size: [256, 192]  # Rectangular input: (height, width) to match WiLoR and pretrained model
+  patch_size: 16
+  embed_dim: 1280
+  vit_depth: 32
+  vit_num_heads: 16
+  num_hand_joints: 15
+  num_vertices: 778
+  num_scales: 3  # Number of scales for multi-scale features
+  focal_length: 5000.0
+  joint_rep_type: "aa"  # Joint representation: "aa" (axis-angle) or "6d" (6D rotation)
+  use_official_naf: true  # Use official pretrained NAF (true) or custom NAF (false)
+  pretrained_weights: "/data0/users/Robert/linweiquan/UTNet/pretraining_model/vitpose_backbone.pth"  # Path to pretrained ViT backbone weights
+
+# MANO
+mano:
+  model_path: "/data0/users/Robert/linweiquan/UTNet/mano_data/MANO_RIGHT.pkl"  # Update with actual path
+  mean_params_path: "/data0/users/Robert/linweiquan/UTNet/mano_data/mano_mean_params.npz"  # Update with actual path
+  gender: "neutral"
+  num_hand_joints: 15
+
+# Detector
+detector:
+  path: "/data0/users/Robert/linweiquan/WiLoR/pretrained_models/detector.pt"
+  conf_threshold: 0.3
+  iou_threshold: 0.5
+
+# Loss weights
+loss:
+  w_2d: 0.01
+  w_3d_joint: 0.05
+  w_3d_vert: 0.0
+  w_prior: 0.001
+  w_aux: 0.001
+  use_vertex_loss: true
+  use_aux_loss: true
+
+# Training
+training:
+  batch_size: 24
+  num_workers: 8
+  num_epochs: 100
+  learning_rate: 1.0e-5
+  weight_decay: 0.0001
+  warmup_epochs: 5
+  save_dir: "./checkpoints"
+  log_dir: "./logs"
+  save_freq: 10  # Save checkpoint every N epochs
+  test_freq: 5  # Test every N epochs
+
+# Optimizer
+optimizer:
+  type: "AdamW"
+  lr: 1.0e-5
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+
+# Scheduler
+scheduler:
+  type: "cosine"
+  T_max: 100
+  eta_min: 1.0e-7
+
+# Data augmentation
+augmentation:
+  sigma_com: 10.0
+  sigma_sc: 0.2
+  rot_range: 180.0
+
+# Device
+device: "cuda"  # or "cpu"
+
+# Logging
+logging:
+  log_freq: 100  # Log every N iterations
+  tensorboard: true
+

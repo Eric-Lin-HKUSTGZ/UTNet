@@ -1,0 +1,7 @@
+checkpoints
+logs
+visualization/results
+pretraining_model
+mano_data
+*.out
+*.log
