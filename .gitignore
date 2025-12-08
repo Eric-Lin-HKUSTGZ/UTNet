@@ -5,3 +5,4 @@ pretraining_model
 mano_data
 *.out
 *.log
+*.pyc

@@ -2,7 +2,7 @@
 
 # Dataset
 dataset:
-  name: "HO3D"  # "DexYCB" or "HO3D"
+  name: "DexYCB"  # "DexYCB" or "HO3D"
   root_dir: "/data1/users/Robert/datasets"  # Update with actual path
   setup: "s0"  # Dex-YCB setup (only used for DexYCB)
   split: "train"  # or "test"
@@ -54,7 +54,7 @@ loss:
 
 # Training
 training:
-  batch_size: 24
+  batch_size: 32
   num_workers: 8
   num_epochs: 100
   learning_rate: 1.0e-5

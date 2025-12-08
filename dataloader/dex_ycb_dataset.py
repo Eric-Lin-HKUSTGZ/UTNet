@@ -91,6 +91,8 @@ class DexYCBDataset(Dataset):
             train: whether in training mode
         """
         self.setup = setup
+        if split == 'val':
+            split = 'test'
         self.split = split
         self.root_dir = root_dir.rstrip('/')
         self.dex_ycb_root = os.path.join(self.root_dir, 'dex-ycb')
